@@ -97,6 +97,8 @@ namespace PowerWatch
         public List<Prediction> Predictions = new List<Prediction>();
         public LearnStore LearnData = new LearnStore();
         public double VideoDecode;
+        public int? GpuBusy;
+        public bool WantCheckup;                     // the Checkup tab is showing
 
         public event Action Changed;
 
@@ -109,10 +111,12 @@ namespace PowerWatch
         bool? wasOnBattery;
         Dictionary<string, DateTime> heavySince = new Dictionary<string, DateTime>();
         bool fast, busy, reading;
-        int ticks;
+        DateTime readingSince, busySince;
+        int ticks, refreshes;
         DateTime checkupRead = DateTime.MinValue;
 
         public Scanner Scanner { get { return scanner; } }
+        Dictionary<int, double> lastGpu;
 
         public Model()
         {
@@ -132,24 +136,47 @@ namespace PowerWatch
             Refresh();
         }
 
+        bool stopped;
+
+        // Saves everything (on quit, sign-out and shutdown).
         public void Stop()
         {
+            if (stopped) return;
+            stopped = true;
             timer.Stop();
-            SaveHistory();
-            Learn.Save(LearnData);
+            Save();
+        }
+
+        // Saves now, keeps running (used when Windows is about to sign out or shut down; that can be cancelled).
+        public void Save()
+        {
+            Json.Save("history.json", new History { Samples = new List<Sample>(Samples), Predictions = new List<Prediction>(Predictions) });
+            Learn.Save(SnapshotLearn());
+        }
+
+        LearnStore SnapshotLearn()
+        {
+            LearnStore copy = new LearnStore { Minutes = new List<Minute>(LearnData.Minutes), K = LearnData.K, Tuned = LearnData.Tuned };
+            foreach (KeyValuePair<string, Prof> kv in LearnData.Profiles) copy.Profiles[kv.Key] = new Prof { Wh = kv.Value.Wh, Hours = kv.Value.Hours };
+            return copy;
         }
 
         void SaveHistory()
         {
-            Json.Save("history.json", new History { Samples = Samples, Predictions = Predictions });
+            History h = new History { Samples = new List<Sample>(Samples), Predictions = new List<Prediction>(Predictions) };
+            Task.Run(delegate { Json.Save("history.json", h); });
         }
 
         void Notify() { if (Changed != null) Changed(); }
 
         async void Tick()
         {
-            if (reading) return;
+            // never stay stuck if Windows doesn't answer
+            if (reading && (DateTime.UtcNow - readingSince).TotalSeconds > 20) reading = false;
+            if (busy && (DateTime.UtcNow - busySince).TotalSeconds > 60) busy = false;
+            if (reading || stopped) return;
             reading = true;
+            readingSince = DateTime.UtcNow;
             PowerInfo p;
             try { p = await Task.Run(delegate { return Sensors.Power(); }); }
             catch (Exception ex) { Log.Write("power: " + ex.Message); reading = false; return; }
@@ -162,10 +189,11 @@ namespace PowerWatch
             if (wasOnBattery.HasValue && wasOnBattery.Value != p.OnBattery) Predictions.Clear();
             wasOnBattery = p.OnBattery;
 
-            if (p.OnBattery && p.WattsKnown)
-                Samples.Add(new Sample { T = now, W = p.Watts, MWh = p.GaugeMWh > 0 ? p.GaugeMWh : -1 });
+            if (p.OnBattery && (p.WattsKnown || p.GaugeMWh > 0))
+                Samples.Add(new Sample { T = now, W = p.WattsKnown ? p.Watts : -1, MWh = p.GaugeMWh > 0 ? p.GaugeMWh : -1 });
             Samples.RemoveAll(delegate(Sample s) { return (now - s.T).TotalSeconds > 3600; });
 
+            if (ticks % 100 == 0) SaveHistory();           // every 5 minutes
             if (ticks % 20 == 0)
             {
                 if (p.OnBattery && (Predictions.Count == 0 || (now - Predictions[Predictions.Count - 1].T).TotalSeconds >= 295))
@@ -174,7 +202,6 @@ namespace PowerWatch
                     if (e.Minutes > 0) Predictions.Add(new Prediction { T = now, EmptyAt = now.AddMinutes(e.Minutes), Percent = p.Percent });
                     Predictions.RemoveAll(delegate(Prediction x) { return (now - x.T).TotalSeconds > 7200; });
                 }
-                SaveHistory();
             }
 
             int fp = Scanner.ForegroundPid();
@@ -184,7 +211,7 @@ namespace PowerWatch
                 FrontName = NameOfPid(fp);
             }
             LearnTick(p, now);
-            if (fast || ticks % 10 == 0) Refresh();
+            if (fast || ticks % 20 == 0) Refresh();
             else Notify();
         }
 
@@ -239,7 +266,7 @@ namespace PowerWatch
                 }
                 minuteSum = 0; minuteN = 0; minuteApps.Clear(); minuteStart = now;
             }
-            if (ticks % 100 == 0) Learn.Save(LearnData);
+            if (ticks % 300 == 0) { LearnStore copy = SnapshotLearn(); Task.Run(delegate { Learn.Save(copy); }); }   // every 15 minutes
             if (ticks % 1200 == 0) RunBacktest();
         }
 
@@ -262,29 +289,37 @@ namespace PowerWatch
 
         public async void Refresh()
         {
-            if (busy) return;
+            if (busy || stopped) return;
             busy = true;
+            busySince = DateTime.UtcNow;
+            refreshes++;
             bool onBattery = Power.OnBattery;
-            bool readCheck = (DateTime.UtcNow - checkupRead).TotalSeconds >= 30;
+            bool detail = fast;
+            bool readGpu = fast && refreshes % 2 == 1;                       // graphics chip: only while open, every ~6 s
+            bool readCheck = (WantCheckup && (DateTime.UtcNow - checkupRead).TotalMinutes >= 10) || checkupRead == DateTime.MinValue;
             List<AppGroup> apps = null, sys = null;
             int now = 0, bat = 0, chg = 0;
             Checkup ck = null;
             GpuReading gpu = null;
             try
             {
+                Dictionary<int, double> prevGpu = lastGpu;
                 await Task.Run(delegate
                 {
-                    gpu = Sensors.Gpu();
-                    scanner.Build(gpu.PerPid, out apps, out sys);
-                    Sensors.PowerModes(onBattery, out now, out bat, out chg);
-                    if (readCheck) ck = ReadCheckup();
+                    lock (scanner)
+                    {
+                        if (readGpu) gpu = Sensors.Gpu();
+                        scanner.Build(gpu != null ? gpu.PerPid : prevGpu, detail, out apps, out sys);
+                        Sensors.PowerModes(onBattery, out now, out bat, out chg);
+                        if (readCheck) ck = ReadCheckup();
+                    }
                 });
             }
             catch (Exception ex) { Log.Write("refresh: " + ex); busy = false; return; }
             PowerMode = now; BatteryMode = bat; ChargerMode = chg;
             if (ck != null) { Checkup = ck; checkupRead = DateTime.UtcNow; }
-            Power.GpuBusy = gpu.Total;
-            VideoDecode = gpu.VideoDecode;
+            if (gpu != null) { GpuBusy = gpu.Total; VideoDecode = gpu.VideoDecode; lastGpu = gpu.PerPid; }
+            if (!fast) { lastGpu = null; GpuBusy = null; }
 
             // Only warn about a hidden program once it has stayed heavy for 20 seconds (not a quick blip).
             Dictionary<string, DateTime> still = new Dictionary<string, DateTime>();
@@ -310,7 +345,9 @@ namespace PowerWatch
 
         public bool IsProtected(AppGroup g)
         {
-            return g.IsSelf || g.Kind == Kind.System || Path.GetFileName(g.ExePath).Equals("explorer.exe", StringComparison.OrdinalIgnoreCase);
+            if (g.IsSelf || g.Kind == Kind.System) return true;
+            string win = Environment.GetFolderPath(Environment.SpecialFolder.Windows).TrimEnd('\\') + "\\";
+            return string.IsNullOrEmpty(g.ExePath) || g.ExePath.StartsWith(win, StringComparison.OrdinalIgnoreCase);
         }
 
         // Normal quit: asks each window to close, so apps with unsaved work ask you first.
@@ -329,8 +366,10 @@ namespace PowerWatch
             int failed = 0;
             foreach (int pid in g.Pids)
             {
-                try { using (Process p = Process.GetProcessById(pid)) p.Kill(); }
-                catch { failed++; }
+                long created;
+                g.Created.TryGetValue(pid, out created);
+                int r = Scanner.TerminateIfSame(pid, created);
+                if (r < 0) failed++;                                      // Windows refused (e.g. running as administrator)
             }
             return failed;
         }
@@ -354,14 +393,12 @@ namespace PowerWatch
                 check.Stop();
                 check.Dispose();
                 List<string> stillOpen = new List<string>();
+                Dictionary<int, List<IntPtr>> wins;
+                HashSet<int> withWindow = Scanner.WindowPids(out wins);
                 foreach (AppGroup g in gs)
                 {
-                    bool alive = false;
-                    foreach (int pid in g.Pids)
-                    {
-                        try { using (Process p = Process.GetProcessById(pid)) if (!p.HasExited) alive = true; } catch { }
-                    }
-                    if (alive) stillOpen.Add(g.Name);
+                    if (!g.HasWindow) continue;
+                    foreach (int pid in g.Pids) if (withWindow.Contains(pid)) { stillOpen.Add(g.Name); break; }
                 }
                 int done = gs.Count - stillOpen.Count;
                 string s = "Quit " + done + (done == 1 ? " app." : " apps.");
@@ -401,7 +438,7 @@ namespace PowerWatch
         {
             DateTime cut = DateTime.UtcNow.AddSeconds(-secs);
             double sum = 0; int n = 0;
-            foreach (Sample s in Samples) if (s.T >= cut) { sum += s.W; n++; }
+            foreach (Sample s in Samples) if (s.T >= cut && s.W >= 0) { sum += s.W; n++; }
             if (n > 0) return sum / n;
             return Power.WattsKnown ? Power.Watts : PluggedEstimate();
         }
@@ -422,7 +459,7 @@ namespace PowerWatch
                 }
                 prev = s;
             }
-            if (time < Math.Min(secs, 300) * 0.8 || drop < 100) return null;
+            if (time < Math.Min(secs, 300) * 0.8 || drop < 1000) return null;            // at least 1 Wh, so gauge steps don't swing it
             return drop / 1000 / (time / 3600);
         }
 
@@ -496,7 +533,7 @@ namespace PowerWatch
             {
                 DateTime a = now.AddSeconds(-(k + 1) * 300), b = now.AddSeconds(-k * 300);
                 double sum = 0; int n = 0;
-                foreach (Sample s in Samples) if (s.T >= a && s.T < b) { sum += s.W; n++; }
+                foreach (Sample s in Samples) if (s.T >= a && s.T < b && s.W >= 0) { sum += s.W; n++; }
                 if (n >= 20) blocks.Add(sum / n);
             }
             double? g = GaugeWatts(3600);
@@ -823,16 +860,6 @@ namespace PowerWatch
 
         // ---------- checkup
 
-        static readonly Regex Hex = new Regex(@":\s*0x([0-9a-fA-F]{8})\s*$", RegexOptions.Multiline);
-
-        static int PowerSettingDcSeconds(string sub, string setting)
-        {
-            string o = Shell.Run(Paths.System32("powercfg.exe"), "/qh SCHEME_CURRENT " + sub + " " + setting);
-            MatchCollection m = Hex.Matches(o);
-            if (m.Count < 2) return -1;
-            return int.Parse(m[m.Count - 1].Groups[1].Value, System.Globalization.NumberStyles.HexNumber);
-        }
-
         static Checkup ReadCheckup()
         {
             Checkup c = new Checkup();
@@ -842,10 +869,8 @@ namespace PowerWatch
             if (Native.GlobalMemoryStatusEx(ref ms))
             {
                 c.FreeMemPct = 100 - (int)ms.dwMemoryLoad;
-                double commitUsed = ms.ullTotalPageFile - ms.ullAvailPageFile, physUsed = ms.ullTotalPhys - ms.ullAvailPhys;
-                c.PagedGB = Math.Max(0, (commitUsed - physUsed) / 1073741824.0);
             }
-            int sleep = PowerSettingDcSeconds("SUB_SLEEP", "STANDBYIDLE"), screen = PowerSettingDcSeconds("SUB_VIDEO", "VIDEOIDLE");
+            int sleep = Native.ReadDcSetting(Sensors.SubSleep, Sensors.StandbyIdle) ?? -1, screen = Native.ReadDcSetting(Sensors.SubVideo, Sensors.VideoIdle) ?? -1;
             c.SleepMinutesOnBattery = sleep < 0 ? -1 : sleep / 60;
             c.ScreenMinutesOnBattery = screen < 0 ? -1 : screen / 60;
 
@@ -862,6 +887,7 @@ namespace PowerWatch
                         {
                             byte[] b = appr == null ? null : appr.GetValue(name) as byte[];
                             if (b != null && b.Length > 0 && (b[0] & 1) == 1) continue;      // switched off
+                            if (name.Equals("PowerWatch", StringComparison.OrdinalIgnoreCase)) continue;
                             c.StartupCount++;
                             string cmd = Environment.ExpandEnvironmentVariables(Convert.ToString(run.GetValue(name, "")));
                             string exe = cmd.StartsWith("\"") ? cmd.Substring(1, Math.Max(0, cmd.IndexOf('"', 1) - 1)) : cmd.Split(' ')[0];
@@ -889,9 +915,19 @@ namespace PowerWatch
                 try
                 {
                     if (!Directory.Exists(folder)) continue;
+                    RegistryHive hive = folder == Environment.GetFolderPath(Environment.SpecialFolder.Startup) ? RegistryHive.CurrentUser : RegistryHive.LocalMachine;
                     foreach (string f in Directory.GetFiles(folder))
                     {
                         if (Path.GetFileName(f).Equals("desktop.ini", StringComparison.OrdinalIgnoreCase)) continue;
+                        byte[] state = null;
+                        try
+                        {
+                            using (RegistryKey root = RegistryKey.OpenBaseKey(hive, RegistryView.Default))
+                            using (RegistryKey ap = root.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder", false))
+                                state = ap == null ? null : ap.GetValue(Path.GetFileName(f)) as byte[];
+                        }
+                        catch { state = null; }
+                        if (state != null && state.Length > 0 && (state[0] & 1) == 1) continue;
                         c.StartupCount++;
                         string n = Path.GetFileNameWithoutExtension(f);
                         if (!vendors.Contains(n)) vendors.Add(n);
@@ -917,9 +953,9 @@ namespace PowerWatch
                 items.Add(new CheckItem { Glyph = "", Color = Palette.Green, Title = "Restarted recently",
                     Text = days == 0 ? "Your laptop was restarted today. Nothing to do." : "Restarted " + days + (days == 1 ? " day" : " days") + " ago. Restarting about once a week is plenty (Restart, not Shut down)." });
 
-            if (c.FreeMemPct < 20 || c.PagedGB >= 4)
+            if (c.FreeMemPct <= 15)
                 items.Add(new CheckItem { Glyph = "", Color = Palette.Orange, Title = "Memory is getting full",
-                    Text = "Only " + c.FreeMemPct + "% of memory is free" + (c.PagedGB >= 1 ? " and Windows has moved about " + c.PagedGB.ToString("0.0") + " GB to the disk" : "") + ". That costs speed and power. Use Focus on the Now tab to quit the apps you're not using." });
+                    Text = "Only " + c.FreeMemPct + "% of memory is free, so Windows starts using the disk instead. That costs speed and power. Use Focus on the Now tab to quit the apps you're not using." });
             else
                 items.Add(new CheckItem { Glyph = "", Color = Palette.Green, Title = "Memory: " + c.FreeMemPct + "% free", Text = "Plenty of room. Nothing to do." });
 

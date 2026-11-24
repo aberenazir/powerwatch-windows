@@ -56,7 +56,7 @@ namespace PowerWatch
 
         public static void Draw(Graphics g, string text, Font f, Rectangle r, Color c, TextFormatFlags flags = Wrap)
         {
-            TextRenderer.DrawText(g, text, f, r, c, flags);
+            TextRenderer.DrawText(g, text, f, r, c, flags | TextFormatFlags.PreserveGraphicsTranslateTransform | TextFormatFlags.PreserveGraphicsClipping);
         }
 
         public static GraphicsPath Rounded(RectangleF r, float radius)

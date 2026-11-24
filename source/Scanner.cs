@@ -16,6 +16,7 @@ namespace PowerWatch
     class Proc
     {
         public int Pid, Ppid, Session;
+        public long Create;            // creation time: tells a process apart from a later one with the same number
         public string Exe = "";        // file name, e.g. chrome.exe
         public string Path = "";
         public double Cpu, Gpu, Power;
@@ -40,6 +41,7 @@ namespace PowerWatch
         public double Cpu, Power, Share;
         public long Mem;
         public List<int> Pids = new List<int>();
+        public Dictionary<int, long> Created = new Dictionary<int, long>();
         public List<ProcLine> Procs = new List<ProcLine>();
         public bool HasWindow;
         public string Explain;
@@ -111,7 +113,7 @@ namespace PowerWatch
 
     class Scanner
     {
-        readonly Dictionary<int, long> lastTimes = new Dictionary<int, long>();
+        readonly Dictionary<long, long> lastTimes = new Dictionary<long, long>();   // key: pid ^ creation time
         readonly Dictionary<int, string> argsCache = new Dictionary<int, string>();
         readonly Dictionary<string, string> nameCache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         readonly Stopwatch clock = Stopwatch.StartNew();
@@ -127,7 +129,7 @@ namespace PowerWatch
         {
             if (string.IsNullOrEmpty(path)) return fallback;
             string n;
-            if (nameCache.TryGetValue(path, out n)) return n;
+            lock (nameCache) if (nameCache.TryGetValue(path, out n)) return n;
             n = fallback;
             try
             {
@@ -138,7 +140,7 @@ namespace PowerWatch
             }
             catch { }
             if (fallback.Equals("msedgewebview2", StringComparison.OrdinalIgnoreCase)) n = "Web parts inside apps (WebView2)";
-            nameCache[path] = n;
+            lock (nameCache) nameCache[path] = n;
             return n;
         }
 
@@ -152,10 +154,14 @@ namespace PowerWatch
                 try
                 {
                     if (!Native.IsWindowVisible(hwnd) || Native.GetWindow(hwnd, 4) != IntPtr.Zero) return true;    // GW_OWNER
-                    if ((Native.GetWindowLong(hwnd, -20) & 0x80) != 0) return true;                                  // tool window
+                    int ex = Native.GetWindowLong(hwnd, -20);
+                    if ((ex & 0x80) != 0 || (ex & 0x08000000) != 0) return true;                                     // tool / no-activate window
                     if (Native.GetWindowTextLength(hwnd) == 0) return true;
+                    Native.RECT rc;
+                    if (!Native.GetWindowRect(hwnd, out rc) || rc.Right <= rc.Left || rc.Bottom <= rc.Top) return true;
                     int cloaked;
-                    if (Native.DwmGetWindowAttribute(hwnd, 14, out cloaked, 4) == 0 && cloaked != 0) return true;    // hidden by Windows
+                    // cloaked = hidden by Windows; 2 (shell) = on another virtual desktop, still a real window
+                    if (Native.DwmGetWindowAttribute(hwnd, 14, out cloaked, 4) == 0 && cloaked != 0 && !(cloaked == 2 && OnOtherDesktop(hwnd))) return true;
                     int pid;
                     Native.GetWindowThreadProcessId(hwnd, out pid);
                     StringBuilder cls = new StringBuilder(64);
@@ -170,6 +176,7 @@ namespace PowerWatch
                             if (cp != pid) { inner = cp; return false; }
                             return true;
                         }, IntPtr.Zero);
+                        if (inner == pid) return true;               // empty frame (suspended Store app): skip
                         pid = inner;
                     }
                     pids.Add(pid);
@@ -184,6 +191,9 @@ namespace PowerWatch
             return pids;
         }
 
+        static readonly HashSet<string> ShellClasses = new HashSet<string>
+        { "Shell_TrayWnd", "Shell_SecondaryTrayWnd", "Progman", "WorkerW", "NotifyIconOverflowWindow", "TopLevelWindowForOverflowXamlIsland", "Windows.UI.Core.CoreWindow" };
+
         public static int ForegroundPid()
         {
             IntPtr h = Native.GetForegroundWindow();
@@ -192,6 +202,7 @@ namespace PowerWatch
             Native.GetWindowThreadProcessId(h, out pid);
             StringBuilder cls = new StringBuilder(64);
             Native.GetClassName(h, cls, 64);
+            if (ShellClasses.Contains(cls.ToString())) return 0;   // taskbar, desktop, Start: not an app
             if (cls.ToString() == "ApplicationFrameWindow")
             {
                 int frame = pid, inner = pid;
@@ -207,63 +218,153 @@ namespace PowerWatch
             return pid;
         }
 
-        public void Build(Dictionary<int, double> gpuByPid, out List<AppGroup> apps, out List<AppGroup> system)
+        readonly Dictionary<long, string> pathCache = new Dictionary<long, string>();     // key: pid ^ creation time
+
+        // Every process in one cheap call: number, parent, session, name, processor time, memory, creation time.
+        // Works for Windows' own processes too (no permission needed).
+        Dictionary<int, Proc> Snapshot(double wallSeconds)
+        {
+            Dictionary<int, Proc> procs = new Dictionary<int, Proc>();
+            int size = 1 << 20;
+            IntPtr buf = IntPtr.Zero;
+            try
+            {
+                for (int attempt = 0; attempt < 6; attempt++)
+                {
+                    buf = Marshal.AllocHGlobal(size);
+                    int needed;
+                    int status = Native.NtQuerySystemInformation(5, buf, size, out needed);
+                    if (status == 0) break;
+                    Marshal.FreeHGlobal(buf);
+                    buf = IntPtr.Zero;
+                    if (status != unchecked((int)0xC0000004)) return null;    // not "buffer too small"
+                    size = Math.Max(size * 2, needed + (1 << 16));
+                }
+                if (buf == IntPtr.Zero) return null;
+                long offset = 0;
+                HashSet<int> seen = new HashSet<int>();
+                while (true)
+                {
+                    IntPtr e = new IntPtr(buf.ToInt64() + offset);
+                    int next = Marshal.ReadInt32(e, 0x00);
+                    if (next < 0 || offset + next >= size) next = 0;            // never read past the buffer
+                    long create = Marshal.ReadInt64(e, 0x20);
+                    long user = Marshal.ReadInt64(e, 0x28), kernel = Marshal.ReadInt64(e, 0x30);
+                    int nameLen = (ushort)Marshal.ReadInt16(e, 0x38);
+                    IntPtr namePtr = Marshal.ReadIntPtr(e, 0x40);
+                    int pid = (int)Marshal.ReadIntPtr(e, 0x50).ToInt64();
+                    int ppid = (int)Marshal.ReadIntPtr(e, 0x58).ToInt64();
+                    int session = Marshal.ReadInt32(e, 0x64);
+                    long ws = Marshal.ReadIntPtr(e, 0x90).ToInt64();
+                    if (pid != 0)
+                    {
+                        Proc p = new Proc { Pid = pid, Ppid = ppid, Session = session, Create = create, Mem = ws };
+                        p.Exe = nameLen > 0 && namePtr != IntPtr.Zero ? Marshal.PtrToStringUni(namePtr, nameLen / 2) : (pid == 4 ? "System" : "");
+                        long t = user + kernel, before;
+                        long key = pid ^ create;
+                        if (wallSeconds > 0 && lastTimes.TryGetValue(key, out before) && t >= before)
+                            p.Cpu = 100.0 * ((t - before) / 1e7) / wallSeconds;
+                        lastTimes[key] = t;
+                        seenKeys.Add(key);
+                        procs[pid] = p;
+                    }
+                    if (next == 0) break;
+                    offset += next;
+                }
+                return procs;
+            }
+            catch (Exception ex) { Log.Write("snapshot: " + ex.Message); return null; }
+            finally { if (buf != IntPtr.Zero) Marshal.FreeHGlobal(buf); }
+        }
+
+        readonly HashSet<long> seenKeys = new HashSet<long>();
+
+        string PathOf(Proc p)
+        {
+            long key = p.Pid ^ p.Create;
+            string path;
+            if (pathCache.TryGetValue(key, out path)) return path;
+            IntPtr h = Native.OpenProcess(Native.PROCESS_QUERY_LIMITED_INFORMATION, false, p.Pid);
+            path = "";
+            if (h != IntPtr.Zero) { path = Native.ExePath(h); Native.CloseHandle(h); }
+            pathCache[key] = path;
+            return path;
+        }
+
+        // Stops a process only if it's still the one we saw. 1 = stopped, 0 = already gone / different program, -1 = refused.
+        public static int TerminateIfSame(int pid, long create)
+        {
+            IntPtr h = Native.OpenProcess(0x0001 | Native.PROCESS_QUERY_LIMITED_INFORMATION, false, pid);   // PROCESS_TERMINATE
+            if (h == IntPtr.Zero)
+            {
+                int err = Marshal.GetLastWin32Error();
+                return err == 5 ? -1 : 0;                                   // 5 = access denied
+            }
+            try
+            {
+                Native.FILETIME c, x, k, u;
+                if (!Native.GetProcessTimes(h, out c, out x, out k, out u) || (create != 0 && c.Value != create)) return 0;
+                return Native.TerminateProcess(h, 1) ? 1 : -1;
+            }
+            finally { Native.CloseHandle(h); }
+        }
+
+        [ComImport, Guid("a5cd92ff-29be-454c-8d04-d82879fb3f1b"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        interface IVirtualDesktopManager
+        {
+            [PreserveSig] int IsWindowOnCurrentVirtualDesktop(IntPtr hwnd, out int onCurrent);
+            [PreserveSig] int GetWindowDesktopId(IntPtr hwnd, out Guid desktop);
+        }
+
+        [ComImport, Guid("aa509086-5ca9-4c25-8f95-589d3c07b48a")]
+        class VirtualDesktopManager { }
+
+        // A window hidden only because it's on another virtual desktop is still a real window.
+        static bool OnOtherDesktop(IntPtr hwnd)
+        {
+            try
+            {
+                IVirtualDesktopManager vdm = (IVirtualDesktopManager)new VirtualDesktopManager();
+                Guid id;
+                int onCurrent;
+                bool other = vdm.GetWindowDesktopId(hwnd, out id) == 0 && id != Guid.Empty &&
+                             vdm.IsWindowOnCurrentVirtualDesktop(hwnd, out onCurrent) == 0 && onCurrent == 0;
+                Marshal.ReleaseComObject(vdm);
+                return other;
+            }
+            catch { return false; }
+        }
+
+        // Is this still the same process we saw (not a new one that got the same number)?
+        public static bool StillSame(int pid, long create)
+        {
+            IntPtr h = Native.OpenProcess(Native.PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+            if (h == IntPtr.Zero) return false;
+            try
+            {
+                Native.FILETIME c, x, k, u;
+                return Native.GetProcessTimes(h, out c, out x, out k, out u) && (create == 0 || c.Value == create);
+            }
+            finally { Native.CloseHandle(h); }
+        }
+
+        // detail = false (panel closed): processor use only, no command lines, cheaper.
+        public void Build(Dictionary<int, double> gpuByPid, bool detail, out List<AppGroup> apps, out List<AppGroup> system)
         {
             long wall = clock.ElapsedTicks;
             double wallSeconds = lastWall < 0 ? 0 : (wall - lastWall) / (double)Stopwatch.Frequency;
             lastWall = wall;
 
-            // 1. Every process: parent, file, processor time, memory.
-            Dictionary<int, Proc> procs = new Dictionary<int, Proc>();
-            IntPtr snap = Native.CreateToolhelp32Snapshot(Native.TH32CS_SNAPPROCESS, 0);
-            if (snap != IntPtr.Zero && snap != new IntPtr(-1))
-            {
-                try
-                {
-                    Native.PROCESSENTRY32W e = new Native.PROCESSENTRY32W();
-                    e.dwSize = (uint)Marshal.SizeOf(typeof(Native.PROCESSENTRY32W));
-                    if (Native.Process32FirstW(snap, ref e))
-                    {
-                        do
-                        {
-                            int pid = (int)e.th32ProcessID;
-                            if (pid == 0) continue;
-                            procs[pid] = new Proc { Pid = pid, Ppid = (int)e.th32ParentProcessID, Exe = e.szExeFile ?? "" };
-                        } while (Native.Process32NextW(snap, ref e));
-                    }
-                }
-                finally { Native.CloseHandle(snap); }
-            }
-
-            HashSet<int> seen = new HashSet<int>();
-            foreach (Proc p in procs.Values)
-            {
-                int s;
-                if (Native.ProcessIdToSessionId(p.Pid, out s)) p.Session = s;
-                IntPtr h = Native.OpenProcess(Native.PROCESS_QUERY_LIMITED_INFORMATION, false, p.Pid);
-                if (h == IntPtr.Zero) continue;
-                try
-                {
-                    p.Path = Native.ExePath(h);
-                    Native.FILETIME c, x, k, u;
-                    if (Native.GetProcessTimes(h, out c, out x, out k, out u))
-                    {
-                        long t = k.Value + u.Value, before;
-                        // processor %, where 100 % = one core fully busy (like the Mac version)
-                        if (wallSeconds > 0 && lastTimes.TryGetValue(p.Pid, out before) && t >= before)
-                            p.Cpu = 100.0 * ((t - before) / 1e7) / wallSeconds;
-                        lastTimes[p.Pid] = t;
-                        seen.Add(p.Pid);
-                    }
-                    Native.PROCESS_MEMORY_COUNTERS mc;
-                    if (Native.GetProcessMemoryInfo(h, out mc, (uint)Marshal.SizeOf(typeof(Native.PROCESS_MEMORY_COUNTERS))))
-                        p.Mem = (long)mc.WorkingSetSize.ToUInt64();
-                }
-                finally { Native.CloseHandle(h); }
-            }
-            List<int> gone = new List<int>();
-            foreach (int pid in lastTimes.Keys) if (!seen.Contains(pid)) gone.Add(pid);
-            foreach (int pid in gone) { lastTimes.Remove(pid); argsCache.Remove(pid); }
+            seenKeys.Clear();
+            Dictionary<int, Proc> procs = Environment.Is64BitProcess ? Snapshot(wallSeconds) : null;
+            if (procs == null) procs = LegacySnapshot(wallSeconds);
+            foreach (Proc p in procs.Values) p.Path = PathOf(p);
+            List<long> goneKeys = new List<long>();
+            foreach (long k in lastTimes.Keys) if (!seenKeys.Contains(k)) goneKeys.Add(k);
+            foreach (long k in goneKeys) { lastTimes.Remove(k); pathCache.Remove(k); }
+            List<int> goneArgs = new List<int>();
+            foreach (int pid in argsCache.Keys) if (!procs.ContainsKey(pid)) goneArgs.Add(pid);
+            foreach (int pid in goneArgs) argsCache.Remove(pid);
 
             foreach (Proc p in procs.Values)
             {
@@ -290,12 +391,25 @@ namespace PowerWatch
             // Shells started from a window (cmd, PowerShell) count as scripts, not as system programs.
             foreach (Proc p in procs.Values)
                 if (kinds[p.Pid] == Kind.System && p.Session == mySession && Known.Shells.Contains(p.Name)) kinds[p.Pid] = Kind.Cli;
+            foreach (Proc p in procs.Values)
+            {
+                if (!p.Name.Equals("msedgewebview2", StringComparison.OrdinalIgnoreCase)) continue;
+                Proc a = p;
+                for (int n = 0; n < 20 && a != null && a.Name.Equals("msedgewebview2", StringComparison.OrdinalIgnoreCase); n++)
+                {
+                    Proc par;
+                    a = procs.TryGetValue(a.Ppid, out par) && (par.Create == 0 || a.Create == 0 || par.Create <= a.Create) ? par : null;
+                }
+                if (a != null && kinds.ContainsKey(a.Pid) && kinds[a.Pid] == Kind.System) kinds[p.Pid] = Kind.System;
+            }
 
             Func<int, Proc> parentOf = delegate(int pid)
             {
                 Proc me, par;
                 if (!procs.TryGetValue(pid, out me) || me.Ppid == pid) return null;
-                return procs.TryGetValue(me.Ppid, out par) ? par : null;
+                if (!procs.TryGetValue(me.Ppid, out par)) return null;
+                if (par.Create > 0 && me.Create > 0 && par.Create > me.Create) return null;   // the real parent has exited
+                return par;
             };
 
             Func<int, int> cliRoot = delegate(int pid)
@@ -331,7 +445,8 @@ namespace PowerWatch
                 int root = appRoot(pid);
                 Proc par = parentOf(root);
                 if (par != null && kinds[par.Pid] == Kind.Cli) return "C:" + cliRoot(par.Pid);   // an app started by a script
-                return "B:" + procs[root].Path.ToLowerInvariant();
+                Proc rp = procs[root];
+                return "B:" + (rp.Path.Length > 0 ? rp.Path.ToLowerInvariant() : "?" + rp.Exe.ToLowerInvariant());
             };
 
             Func<int, string> startedBy = delegate(int pid)
@@ -370,6 +485,7 @@ namespace PowerWatch
                 foreach (Proc p in members)
                 {
                     g.Pids.Add(p.Pid);
+                    g.Created[p.Pid] = p.Create;
                     g.Cpu += p.Cpu;
                     g.Power += p.Power;
                     g.Mem += p.Mem;
@@ -396,11 +512,11 @@ namespace PowerWatch
                     Proc main = members.Find(delegate(Proc p) { return string.Equals(p.Path, keyPath, StringComparison.OrdinalIgnoreCase); }) ?? members[0];
                     g.ExePath = main.Path;
                     g.Kind = g.HasWindow ? Kind.App : Kind.Bundle;
-                    g.Name = FriendlyName(g.ExePath, Path.GetFileNameWithoutExtension(g.ExePath));
+                    g.Name = FriendlyName(g.ExePath, g.ExePath.Length > 0 ? Path.GetFileNameWithoutExtension(g.ExePath) : main.Name);
                     g.IconPath = g.ExePath;
                     g.IsSelf = members.Exists(delegate(Proc p) { return p.Pid == myPid; });
                     if (!g.HasWindow) g.Tags.Add("Hidden: no window");
-                    if (Known.Browsers.Contains(Path.GetFileNameWithoutExtension(g.ExePath)))
+                    if (detail && Known.Browsers.Contains(main.Name))
                     {
                         foreach (Proc p in members)
                         {
@@ -418,7 +534,7 @@ namespace PowerWatch
                     g.Kind = Kind.Cli;
                     List<Proc> scripts = members.FindAll(delegate(Proc p) { return kinds[p.Pid] == Kind.Cli && !Known.Shells.Contains(p.Name); });
                     Proc main = scripts.Count > 0 ? scripts[0] : procs[root];
-                    g.Name = Known.Shells.Contains(main.Name) ? "Shell (" + main.Name + ")" : Pretty(main);
+                    g.Name = Known.Shells.Contains(main.Name) ? "Shell (" + main.Name + ")" : (detail ? Pretty(main) : main.Name);
                     g.Tags.Add("Hidden: no window");
                     string by = startedBy(root);
                     if (by != null) g.Tags.Add("Started by " + by);
@@ -442,6 +558,54 @@ namespace PowerWatch
             apps.Sort(delegate(AppGroup a, AppGroup b) { return a.Power != b.Power ? b.Power.CompareTo(a.Power) : b.Cpu.CompareTo(a.Cpu); });
             system.Sort(delegate(AppGroup a, AppGroup b) { return b.Power.CompareTo(a.Power); });
             LastWindows = windows;
+        }
+
+        // Fallback for 32-bit Windows: Toolhelp + opening each process.
+        Dictionary<int, Proc> LegacySnapshot(double wallSeconds)
+        {
+            Dictionary<int, Proc> procs = new Dictionary<int, Proc>();
+            IntPtr snap = Native.CreateToolhelp32Snapshot(Native.TH32CS_SNAPPROCESS, 0);
+            if (snap == IntPtr.Zero || snap == new IntPtr(-1)) return procs;
+            try
+            {
+                Native.PROCESSENTRY32W e = new Native.PROCESSENTRY32W();
+                e.dwSize = (uint)Marshal.SizeOf(typeof(Native.PROCESSENTRY32W));
+                if (Native.Process32FirstW(snap, ref e))
+                {
+                    do
+                    {
+                        int pid = (int)e.th32ProcessID;
+                        if (pid == 0) continue;
+                        procs[pid] = new Proc { Pid = pid, Ppid = (int)e.th32ParentProcessID, Exe = e.szExeFile ?? "" };
+                    } while (Native.Process32NextW(snap, ref e));
+                }
+            }
+            finally { Native.CloseHandle(snap); }
+            foreach (Proc p in procs.Values)
+            {
+                int s;
+                if (Native.ProcessIdToSessionId(p.Pid, out s)) p.Session = s;
+                IntPtr h = Native.OpenProcess(Native.PROCESS_QUERY_LIMITED_INFORMATION, false, p.Pid);
+                if (h == IntPtr.Zero) continue;
+                try
+                {
+                    Native.FILETIME c, x, k, u;
+                    if (Native.GetProcessTimes(h, out c, out x, out k, out u))
+                    {
+                        p.Create = c.Value;
+                        long t = k.Value + u.Value, before, key = p.Pid ^ p.Create;
+                        if (wallSeconds > 0 && lastTimes.TryGetValue(key, out before) && t >= before)
+                            p.Cpu = 100.0 * ((t - before) / 1e7) / wallSeconds;
+                        lastTimes[key] = t;
+                        seenKeys.Add(key);
+                    }
+                    Native.PROCESS_MEMORY_COUNTERS mc;
+                    if (Native.GetProcessMemoryInfo(h, out mc, (uint)Marshal.SizeOf(typeof(Native.PROCESS_MEMORY_COUNTERS))))
+                        p.Mem = (long)mc.WorkingSetSize.ToUInt64();
+                }
+                finally { Native.CloseHandle(h); }
+            }
+            return procs;
         }
 
         // Top-level windows per process from the last scan (used to close apps the normal way).

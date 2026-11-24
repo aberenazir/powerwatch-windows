@@ -93,7 +93,8 @@ namespace PowerWatch
         readonly Icon appIcon;
         readonly ToolStripMenuItem installUpdateItem;
         readonly System.Windows.Forms.Timer updateTimer = new System.Windows.Forms.Timer();
-        readonly RegisteredWaitHandle showWait;
+        readonly RegisteredWaitHandle showWait, quitWait;
+        readonly EventWaitHandle quitSignal;
         IntPtr trayHandle = IntPtr.Zero;
         string trayKey = "";
         bool quitting, checking, userWaiting, installing;
@@ -139,6 +140,11 @@ namespace PowerWatch
             updateTimer.Start();
 
             showWait = ThreadPool.RegisterWaitForSingleObject(showSignal, delegate { RunOnUi(delegate { panel.ShowNearTray(); }); }, null, -1, false);
+            // The installer / uninstaller asks this copy to close properly (saving what it learned) instead of killing it.
+            quitSignal = new EventWaitHandle(false, EventResetMode.AutoReset, Installer.QuitEventName);
+            quitWait = ThreadPool.RegisterWaitForSingleObject(quitSignal, delegate { RunOnUi(Quit); }, null, -1, false);
+            SystemEvents.SessionEnding += OnSessionEnding;
+            Application.ApplicationExit += delegate { model.Stop(); };
             try { Native.RegisterApplicationRestart("/restarted", 0); } catch { }
             if (justUpdated)
             {
@@ -146,6 +152,11 @@ namespace PowerWatch
                 tray.BalloonTipText = "You now have version " + AppInfo.Version + ".";
                 tray.ShowBalloonTip(6000);
             }
+        }
+
+        void OnSessionEnding(object sender, SessionEndingEventArgs e)
+        {
+            try { model.Save(); } catch { }              // signing out or shutting down: save (it may still be cancelled)
         }
 
         void RunOnUi(Action a)
@@ -169,10 +180,10 @@ namespace PowerWatch
             }
             else if (p.HasBattery)
             {
-                text = p.Percent >= 100 ? "⚡" : p.Percent.ToString();
+                text = p.Percent >= 100 ? "bolt" : p.Percent.ToString();
                 back = Color.FromArgb(55, 95, 160);
             }
-            else { text = "⚡"; back = Color.FromArgb(55, 95, 160); }
+            else { text = "bolt"; back = Color.FromArgb(55, 95, 160); }
             if (model.HiddenHog != null) back = Color.FromArgb(220, 120, 0);
 
             string tip = "Power Watch";
@@ -182,7 +193,7 @@ namespace PowerWatch
                 int left = (int)model.GetEstimate().Minutes;
                 if (left > 0) tip += " · " + (left / 60) + "h " + (left % 60).ToString("00") + "m left";
             }
-            else if (p.HasBattery) tip += " · plugged in";
+            else if (p.HasBattery) tip += p.OnBattery ? " · on battery" : " · plugged in";
             if (p.HasBattery) tip += " · " + p.Percent + "%";
             if (model.HiddenHog != null) tip += " · hidden app busy";
             if (tip.Length > 63) tip = tip.Substring(0, 63);
@@ -202,13 +213,24 @@ namespace PowerWatch
                     using (GraphicsPath path = Theme.Rounded(new RectangleF(0, 0, size - 1, size - 1), size * 0.22f))
                     using (SolidBrush b = new SolidBrush(back))
                         g.FillPath(b, path);
-                    float px = text.Length >= 3 ? size * 0.50f : (text.Length == 2 ? size * 0.66f : size * 0.78f);
-                    using (Font f = new Font("Segoe UI", px, FontStyle.Bold, GraphicsUnit.Pixel))
-                    using (StringFormat sf = new StringFormat())
+                    if (text == "bolt")
                     {
-                        sf.Alignment = StringAlignment.Center;
-                        sf.LineAlignment = StringAlignment.Center;
-                        g.DrawString(text, f, Brushes.White, new RectangleF(-1, 0, size + 2, size + 1), sf);
+                        g.FillPolygon(Brushes.White, new[]
+                        {
+                            new PointF(size * 0.58f, size * 0.10f), new PointF(size * 0.24f, size * 0.56f), new PointF(size * 0.48f, size * 0.56f),
+                            new PointF(size * 0.40f, size * 0.90f), new PointF(size * 0.76f, size * 0.42f), new PointF(size * 0.52f, size * 0.42f)
+                        });
+                    }
+                    else
+                    {
+                        float px = text.Length >= 3 ? size * 0.50f : (text.Length == 2 ? size * 0.66f : size * 0.78f);
+                        using (Font f = new Font("Segoe UI", px, FontStyle.Bold, GraphicsUnit.Pixel))
+                        using (StringFormat sf = new StringFormat())
+                        {
+                            sf.Alignment = StringAlignment.Center;
+                            sf.LineAlignment = StringAlignment.Center;
+                            g.DrawString(text, f, Brushes.White, new RectangleF(-1, 0, size + 2, size + 1), sf);
+                        }
                     }
                 }
                 IntPtr h = bmp.GetHicon();
@@ -329,11 +351,14 @@ namespace PowerWatch
             try
             {
                 if (showWait != null) showWait.Unregister(null);
+                if (quitWait != null) quitWait.Unregister(null);
+                SystemEvents.SessionEnding -= OnSessionEnding;
                 updateTimer.Stop();
                 model.Stop();
                 tray.Visible = false;
                 tray.Dispose();
                 if (trayHandle != IntPtr.Zero) Native.DestroyIcon(trayHandle);
+                panel.AllowClose = true;
                 panel.Close();
             }
             catch { }
@@ -347,6 +372,7 @@ namespace PowerWatch
     {
         public const string MutexName = "PowerWatch_SingleInstance_1";
         public const string ShowEventName = "PowerWatch_Show_1";
+        public const string QuitEventName = "PowerWatch_Quit_1";
         const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
         const string RunName = "PowerWatch";
         const string UninstallKey = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\PowerWatch";
@@ -399,9 +425,20 @@ namespace PowerWatch
             using (Mutex probe = new Mutex(false, MutexName, out created)) return !created;
         }
 
-        static void SignalShow()
+        public static void SignalShow()
         {
-            try { EventWaitHandle ev; if (EventWaitHandle.TryOpenExisting(ShowEventName, out ev)) using (ev) ev.Set(); } catch { }
+            try
+            {
+                EventWaitHandle ev;
+                if (EventWaitHandle.TryOpenExisting(ShowEventName, out ev))
+                    using (ev) { Native.AllowSetForegroundWindow(-1); ev.Set(); }   // let it come to the front
+            }
+            catch { }
+        }
+
+        static void AskToQuit()
+        {
+            try { EventWaitHandle ev; if (EventWaitHandle.TryOpenExisting(QuitEventName, out ev)) using (ev) ev.Set(); } catch { }
         }
 
         static void StartInstalled(string args)
@@ -417,6 +454,10 @@ namespace PowerWatch
                 try
                 {
                     if (p.Id == me || !p.ProcessName.StartsWith("PowerWatch", StringComparison.OrdinalIgnoreCase)) continue;
+                    IntPtr h = Native.OpenProcess(Native.PROCESS_QUERY_LIMITED_INFORMATION, false, p.Id);
+                    string path = "";
+                    if (h != IntPtr.Zero) { path = Native.ExePath(h); Native.CloseHandle(h); }
+                    if (!string.Equals(path, Paths.InstalledExe, StringComparison.OrdinalIgnoreCase)) continue;   // only the installed program
                     p.Kill();
                     p.WaitForExit(5000);
                 }
@@ -434,6 +475,7 @@ namespace PowerWatch
                 if (IsRunning()) SignalShow(); else StartInstalled("");
                 return;
             }
+            AskToQuit();
             Mutex m = null;
             for (int i = 0; i < 40 && m == null; i++)
             {
@@ -534,6 +576,8 @@ namespace PowerWatch
                 if (!first) return;
                 if (MessageBox.Show("Remove Power Watch from this computer?\n\n(What it has learned about your battery use is deleted too.)", "Power Watch",
                         MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+                AskToQuit();
+                for (int i = 0; i < 20 && IsRunning(); i++) Thread.Sleep(250);
                 CloseRunningCopies();
                 SetStartWithWindows(false);
                 try { if (File.Exists(ShortcutPath)) File.Delete(ShortcutPath); } catch { }
@@ -546,6 +590,7 @@ namespace PowerWatch
                     psi.CreateNoWindow = true;
                     psi.UseShellExecute = false;
                     psi.WindowStyle = ProcessWindowStyle.Hidden;
+                    psi.WorkingDirectory = Path.GetTempPath();
                     Process.Start(psi);
                 }
                 catch { }
@@ -575,6 +620,7 @@ namespace PowerWatch
 
             if (HasArg(args, "/uninstall")) { Installer.Uninstall(); return; }
             if (!Installer.RunningInstalledCopy()) { Installer.RunSetup(); return; }
+            SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
 
             bool created;
             Mutex m = new Mutex(true, Installer.MutexName, out created);
@@ -583,7 +629,7 @@ namespace PowerWatch
                 m.Dispose();
                 if (!HasArg(args, "/startup") && !HasArg(args, "/restarted"))
                 {
-                    try { EventWaitHandle ev; if (EventWaitHandle.TryOpenExisting(Installer.ShowEventName, out ev)) using (ev) ev.Set(); } catch { }
+                    Installer.SignalShow();
                 }
                 return;
             }

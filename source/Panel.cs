@@ -27,6 +27,7 @@ namespace PowerWatch
         public bool DialogOpen;                      // a dialog from the panel is open: don't hide
         public DateTime HiddenAt = DateTime.MinValue;
         public Action QuitApp;
+        public bool AllowClose;                 // only when Power Watch quits
 
         int Priority
         {
@@ -124,6 +125,18 @@ namespace PowerWatch
             using (Pen p = new Pen(Theme.Line)) e.Graphics.DrawRectangle(p, 0, 0, Width - 1, Height - 1);
         }
 
+        // Alt+F4 just hides the panel (it's needed again next time).
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (!AllowClose && e.CloseReason == CloseReason.UserClosing)
+            {
+                e.Cancel = true;
+                Hide();
+                return;
+            }
+            base.OnFormClosing(e);
+        }
+
         protected override void OnDeactivate(EventArgs e)
         {
             base.OnDeactivate(e);
@@ -133,6 +146,7 @@ namespace PowerWatch
         protected override void OnVisibleChanged(EventArgs e)
         {
             base.OnVisibleChanged(e);
+            m.WantCheckup = Visible && tab == 2;
             m.SetOpen(Visible);
         }
 
@@ -204,7 +218,14 @@ namespace PowerWatch
             List<Block> list = new List<Block>();
             list.Add(new Gap(6));
             list.Add(new HeaderBlock(m));
-            list.Add(new Segmented(new[] { "Now", "Modes & tips", "Checkup" }, tab, delegate(int i) { tab = i; scroll.AutoScrollPosition = Point.Empty; Rebuild(); }));
+            list.Add(new Segmented(new[] { "Now", "Modes & tips", "Checkup" }, tab, delegate(int i)
+            {
+                tab = i;
+                m.WantCheckup = i == 2;
+                if (i == 2) m.Refresh();
+                scroll.AutoScrollPosition = Point.Empty;
+                Rebuild();
+            }));
             return list;
         }
 
@@ -228,7 +249,7 @@ namespace PowerWatch
 
             // power over the last 30 minutes
             DateTime cut = DateTime.UtcNow.AddMinutes(-30);
-            List<Sample> s = m.Samples.FindAll(delegate(Sample x) { return x.T >= cut; });
+            List<Sample> s = m.Samples.FindAll(delegate(Sample x) { return x.T >= cut && x.W >= 0; });
             if (s.Count >= 2 && (s[s.Count - 1].T - s[0].T).TotalSeconds >= 60)
             {
                 int step = Math.Max(1, s.Count / 120);
@@ -424,7 +445,7 @@ namespace PowerWatch
             List<Block> list = new List<Block>();
             PowerInfo p = m.Power;
             BestWay best = m.GetBestWay(Priority);
-            list.Add(new TextBlock(p.OnBattery ? "Battery left in each power mode (" + p.Percent + "% left)" : "If you unplugged now (" + p.Percent + "% left)", Theme.Headline, Theme.Text, null, null, 8));
+            list.Add(new TextBlock(!p.HasBattery ? "Power modes" : p.OnBattery ? "Battery left in each power mode (" + p.Percent + "% left)" : "If you unplugged now (" + p.Percent + "% left)", Theme.Headline, Theme.Text, null, null, 8));
             foreach (ModeEstimate e in m.ModeEstimates()) list.Add(new ModeRow(e, e.Mode == best.Mode));
             list.Add(new TextBlock("The mode in use is measured from your laptop" + (p.OnBattery ? "" : " (from what it uses on battery)") +
                                    ". The others are estimates for the same work, based on how laptops usually behave in each mode. Your settings: on battery " +
@@ -550,7 +571,7 @@ namespace PowerWatch
             {
                 PowerInfo p = m.Power;
                 List<string> parts = new List<string>();
-                if (p.GpuBusy.HasValue) parts.Add("Graphics chip " + p.GpuBusy.Value + "%");
+                if (m.GpuBusy.HasValue) parts.Add("Graphics chip " + m.GpuBusy.Value + "%");
                 if (p.Health > 0) parts.Add("Battery health " + p.Health + "% (" + (p.Health >= 80 ? "normal" : "worn") + ")" + (p.Cycles > 0 ? " · " + p.Cycles + " cycles" : ""));
                 parts.Add(Model.ModeNames[m.PowerMode]);
                 if (p.BatterySaver) parts.Add("Battery saver on");
@@ -566,9 +587,11 @@ namespace PowerWatch
         public override void Paint(Graphics g, int width)
         {
             PowerInfo p = m.Power;
-            bool known = p.OnBattery && p.WattsKnown;
-            string big = known ? p.Watts.ToString("0.0") + " W" : (p.OnBattery ? "... W" : "Plugged in");
-            int lvl = p.Watts >= 25 ? 2 : (p.Watts >= 10 ? 1 : 0);
+            double? gauge = p.OnBattery && !p.WattsKnown ? m.GaugeWatts(600) : null;
+            bool known = p.OnBattery && (p.WattsKnown || gauge.HasValue);
+            double watts = p.WattsKnown ? p.Watts : (gauge ?? 0);
+            string big = known ? (p.WattsKnown ? "" : "\u2248 ") + watts.ToString("0.0") + " W" : (p.OnBattery ? "... W" : (p.HasBattery ? "Plugged in" : "Mains power"));
+            int lvl = watts >= 25 ? 2 : (watts >= 10 ? 1 : 0);
             Theme.Draw(g, big, Theme.Huge, new Rectangle(0, 0, width, Theme.S(40)), Theme.Text, Theme.Line1);
             int bw = Theme.WidthOf(big, Theme.Huge);
             if (known)

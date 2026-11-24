@@ -106,6 +106,9 @@ namespace PowerWatch
         [DllImport("kernel32.dll")]
         public static extern bool CloseHandle(IntPtr h);
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool TerminateProcess(IntPtr h, uint exitCode);
+
         [DllImport("kernel32.dll")]
         public static extern bool GetProcessTimes(IntPtr h, out FILETIME creation, out FILETIME exit, out FILETIME kernel, out FILETIME user);
 
@@ -196,6 +199,55 @@ namespace PowerWatch
         [DllImport("powrprof.dll")]
         public static extern uint PowerGetEffectiveOverlayScheme(out Guid scheme);
 
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SYSTEM_BATTERY_STATE
+        {
+            public byte AcOnLine, BatteryPresent, Charging, Discharging, Spare1, Spare2, Spare3, Tag;
+            public uint MaxCapacity, RemainingCapacity;
+            public int Rate;                       // mW: negative = discharging, 0x80000000 = unknown
+            public uint EstimatedTime, DefaultAlert1, DefaultAlert2;
+        }
+
+        [DllImport("powrprof.dll")]
+        public static extern uint CallNtPowerInformation(int level, IntPtr inBuf, uint inLen, out SYSTEM_BATTERY_STATE outBuf, uint outLen);
+
+        [DllImport("powrprof.dll")]
+        public static extern uint PowerGetActiveScheme(IntPtr root, out IntPtr scheme);
+
+        [DllImport("powrprof.dll")]
+        public static extern uint PowerReadDCValueIndex(IntPtr root, ref Guid scheme, ref Guid sub, ref Guid setting, out uint value);
+
+        [DllImport("kernel32.dll")]
+        public static extern IntPtr LocalFree(IntPtr p);
+
+        [DllImport("ntdll.dll")]
+        public static extern int NtQuerySystemInformation(int infoClass, IntPtr buffer, int length, out int returnLength);
+
+        [DllImport("user32.dll")]
+        public static extern bool AllowSetForegroundWindow(int pid);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct RECT { public int Left, Top, Right, Bottom; }
+
+        [DllImport("user32.dll")]
+        public static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+
+        // A power-plan setting's "on battery" value (no powercfg process needed).
+        public static int? ReadDcSetting(Guid sub, Guid setting)
+        {
+            try
+            {
+                IntPtr p;
+                if (PowerGetActiveScheme(IntPtr.Zero, out p) != 0) return null;
+                Guid scheme = (Guid)Marshal.PtrToStructure(p, typeof(Guid));
+                LocalFree(p);
+                uint v;
+                if (PowerReadDCValueIndex(IntPtr.Zero, ref scheme, ref sub, ref setting, out v) != 0) return null;
+                return (int)v;
+            }
+            catch { return null; }
+        }
+
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
         public static extern int RegisterApplicationRestart(string commandLine, int flags);
 
@@ -229,7 +281,7 @@ namespace PowerWatch
                 if (len <= 0 || len > 1 << 20) return "";
                 buf = Marshal.AllocHGlobal(len);
                 if (NtQueryInformationProcess(h, 60, buf, len, out len) != 0) return "";
-                int strLen = Marshal.ReadInt16(buf);                       // UNICODE_STRING.Length (bytes)
+                int strLen = (ushort)Marshal.ReadInt16(buf);               // UNICODE_STRING.Length (bytes)
                 IntPtr text = Marshal.ReadIntPtr(buf, IntPtr.Size);       // UNICODE_STRING.Buffer
                 return strLen > 0 && text != IntPtr.Zero ? Marshal.PtrToStringUni(text, strLen / 2) : "";
             }
@@ -334,8 +386,11 @@ namespace PowerWatch
             catch (Exception ex) { Log.Write("load " + file + ": " + ex.Message); return null; }
         }
 
+        static readonly object saveGate = new object();
+
         public static void Save<T>(string file, T value)
         {
+            lock (saveGate)
             try
             {
                 string path = Path.Combine(Paths.DataDir, file);

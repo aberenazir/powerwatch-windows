@@ -44,12 +44,22 @@ namespace PowerWatch
         static double fullWh, designWh;
         static int cycles, critical = 5;
 
+        static readonly Guid SubBattery = new Guid("e73a048d-bf27-4f12-9731-8b2076e8891f");
+        static readonly Guid BatLevelCrit = new Guid("9a66d8d7-4ff7-4ef9-b5a2-5a326ca2a469");
+        public static readonly Guid SubSleep = new Guid("238c9fa8-0aad-41ed-83f4-97be242c8f20");
+        public static readonly Guid StandbyIdle = new Guid("29f6c1db-86da-48c5-9fdb-f2b67b1f44da");
+        public static readonly Guid SubVideo = new Guid("7516b95f-f776-4464-8c53-06167f40cc99");
+        public static readonly Guid VideoIdle = new Guid("3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e");
+
+        // WMI with timeouts, so a stuck Windows service can never freeze the app.
         static List<ManagementBaseObject> Query(string scope, string wql)
         {
             List<ManagementBaseObject> list = new List<ManagementBaseObject>();
             try
             {
-                using (ManagementObjectSearcher s = new ManagementObjectSearcher(scope, wql))
+                ManagementScope sc = new ManagementScope(scope, new ConnectionOptions { Timeout = TimeSpan.FromSeconds(5) });
+                EnumerationOptions opts = new EnumerationOptions { Timeout = TimeSpan.FromSeconds(5), ReturnImmediately = true, Rewindable = false };
+                using (ManagementObjectSearcher s = new ManagementObjectSearcher(sc, new ObjectQuery(wql), opts))
                 using (ManagementObjectCollection c = s.Get())
                     foreach (ManagementBaseObject o in c) list.Add(o);
             }
@@ -63,101 +73,82 @@ namespace PowerWatch
             catch { return 0; }
         }
 
-        static bool Flag(ManagementBaseObject o, string prop)
-        {
-            try { object v = o[prop]; return v is bool && (bool)v; }
-            catch { return false; }
-        }
-
         public static PowerInfo Power()
         {
             PowerInfo p = new PowerInfo();
             Native.SYSTEM_POWER_STATUS st;
-            if (Native.GetSystemPowerStatus(out st))
+            bool haveStatus = Native.GetSystemPowerStatus(out st);
+            if (haveStatus)
             {
                 p.OnBattery = st.ACLineStatus == 0;
                 p.HasBattery = (st.BatteryFlag & 128) == 0 && st.BatteryFlag != 255;
-                p.Percent = st.BatteryLifePercent <= 100 ? st.BatteryLifePercent : 0;
-                p.Charging = (st.BatteryFlag & 8) != 0;
+                p.Percent = st.BatteryLifePercent <= 100 ? st.BatteryLifePercent : -1;
+                p.Charging = st.BatteryFlag != 255 && (st.BatteryFlag & 8) != 0;
                 p.BatterySaver = (st.SystemStatusFlag & 1) != 0;
                 if (st.BatteryLifeTime > 0) p.WindowsMinutesLeft = st.BatteryLifeTime / 60;
             }
-            if (!p.HasBattery) { p.OnBattery = false; return p; }
 
-            // Capacity, wear and cycles change slowly: read every 5 minutes.
-            if ((DateTime.UtcNow - staticRead).TotalMinutes >= 5)
+            // Live battery readings straight from Windows' power manager (cheap: no WMI).
+            Native.SYSTEM_BATTERY_STATE bs;
+            double remaining = -1, maxCap = 0;
+            if (Native.CallNtPowerInformation(5, IntPtr.Zero, 0, out bs, (uint)System.Runtime.InteropServices.Marshal.SizeOf(typeof(Native.SYSTEM_BATTERY_STATE))) == 0)
+            {
+                if (bs.BatteryPresent != 0) p.HasBattery = true;
+                p.OnBattery = bs.AcOnLine == 0 && bs.BatteryPresent != 0;
+                if (bs.Charging != 0) p.Charging = true;
+                if (bs.RemainingCapacity > 0 && bs.RemainingCapacity < 10000000) remaining = bs.RemainingCapacity;
+                if (bs.MaxCapacity > 0 && bs.MaxCapacity < 10000000) maxCap = bs.MaxCapacity;
+                if ((uint)bs.Rate != 0x80000000u)
+                {
+                    if (bs.Rate < 0 && -bs.Rate < 500000) { p.Watts = -bs.Rate / 1000.0; p.WattsKnown = p.OnBattery; }
+                    else if (bs.Rate > 0 && bs.Rate < 500000) p.ChargeWatts = bs.Rate / 1000.0;
+                }
+            }
+            if (!p.HasBattery) { p.OnBattery = false; p.WattsKnown = false; p.Percent = 0; return p; }
+
+            // Capacity, wear, cycles and the critical level change slowly: every 10 minutes.
+            if ((DateTime.UtcNow - staticRead).TotalMinutes >= 10)
             {
                 staticRead = DateTime.UtcNow;
                 double f = 0, d = 0; int c = 0;
                 foreach (ManagementBaseObject o in Query(@"root\wmi", "SELECT FullChargedCapacity FROM BatteryFullChargedCapacity")) f += Num(o, "FullChargedCapacity");
                 foreach (ManagementBaseObject o in Query(@"root\wmi", "SELECT DesignedCapacity FROM BatteryStaticData")) d += Num(o, "DesignedCapacity");
                 foreach (ManagementBaseObject o in Query(@"root\wmi", "SELECT CycleCount FROM BatteryCycleCount")) c = Math.Max(c, (int)Num(o, "CycleCount"));
-                if (f > 0) fullWh = f / 1000;
-                if (d > 0) designWh = d / 1000;
+                if (f > 0 && f < 10000000) fullWh = f / 1000;
+                if (d > 0 && d < 10000000) designWh = d / 1000;
                 cycles = c;
-                critical = ReadCriticalLevel();
+                int? crit = Native.ReadDcSetting(SubBattery, BatLevelCrit);
+                critical = crit.HasValue && crit.Value >= 0 && crit.Value <= 50 ? crit.Value : 5;
             }
-            p.FullWh = fullWh;
+            p.FullWh = fullWh > 0 ? fullWh : maxCap / 1000;
             p.DesignWh = designWh;
             p.Cycles = cycles;
             p.CriticalPercent = critical;
-            if (designWh > 0 && fullWh > 0) p.Health = (int)Math.Round(Math.Min(100, fullWh / designWh * 100));
+            if (designWh > 0 && p.FullWh > 0) p.Health = (int)Math.Round(Math.Min(100, p.FullWh / designWh * 100));
 
-            // Live readings from the battery: energy left and how fast it's going in or out.
-            double remaining = 0, discharge = 0, charge = 0;
-            bool any = false, online = false, charging = false;
-            foreach (ManagementBaseObject o in Query(@"root\wmi", "SELECT PowerOnline, Charging, DischargeRate, ChargeRate, RemainingCapacity FROM BatteryStatus"))
-            {
-                any = true;
-                remaining += Num(o, "RemainingCapacity");
-                double dr = Num(o, "DischargeRate"), cr = Num(o, "ChargeRate");
-                if (dr > 0 && dr < 500000) discharge += dr;
-                if (cr > 0 && cr < 500000) charge += cr;
-                online |= Flag(o, "PowerOnline");
-                charging |= Flag(o, "Charging");
-            }
-            if (any)
+            if (remaining > 0)
             {
                 p.GaugeMWh = remaining;
                 p.RemainingWh = remaining / 1000;
-                if (online) p.OnBattery = false;
-                p.Charging |= charging;
-                if (p.OnBattery && discharge > 0) { p.Watts = discharge / 1000; p.WattsKnown = true; }
-                if (!p.OnBattery && charge > 0) p.ChargeWatts = charge / 1000;
             }
-            else if (fullWh > 0) p.RemainingWh = fullWh * p.Percent / 100.0;
-
+            else if (p.FullWh > 0 && p.Percent >= 0) p.RemainingWh = p.FullWh * p.Percent / 100.0;
+            if (p.Percent < 0) p.Percent = p.FullWh > 0 ? (int)Math.Round(Math.Min(100, p.RemainingWh / p.FullWh * 100)) : 0;   // Windows said "unknown"
             if (p.FullWh <= 0 && p.Percent > 0 && p.RemainingWh > 0) p.FullWh = p.RemainingWh * 100 / p.Percent;
             // Windows turns the laptop off (or hibernates) at the critical level, so that charge isn't time left.
             p.UsableWh = Math.Max(0, p.RemainingWh - p.FullWh * p.CriticalPercent / 100.0);
             return p;
         }
 
-        static readonly Regex Hex = new Regex(@":\s*0x([0-9a-fA-F]{8})\s*$", RegexOptions.Multiline);
-
-        // The battery level where Windows takes its "critical battery" action (shut down / hibernate).
-        static int ReadCriticalLevel()
-        {
-            string o = Shell.Run(Paths.System32("powercfg.exe"), "/qh SCHEME_CURRENT SUB_BATTERY BATLEVELCRIT");
-            MatchCollection m = Hex.Matches(o);
-            if (m.Count >= 2)
-            {
-                int dc = int.Parse(m[m.Count - 1].Groups[1].Value, NumberStyles.HexNumber);
-                if (dc >= 0 && dc <= 50) return dc;
-            }
-            return 5;
-        }
-
         // Graphics chip use, per program and overall (Windows' GPU counters, like Task Manager).
         public static GpuReading Gpu()
         {
             GpuReading g = new GpuReading();
-            Dictionary<string, double> perEngine = new Dictionary<string, double>();
+            Dictionary<string, double> perEngine = new Dictionary<string, double>();   // per physical engine
             foreach (ManagementBaseObject o in Query(@"root\cimv2",
                          "SELECT Name, UtilizationPercentage FROM Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine"))
             {
                 string name = Convert.ToString(o["Name"]) ?? "";
-                double u = Num(o, "UtilizationPercentage");
+                double u = Math.Min(100, Num(o, "UtilizationPercentage"));
                 if (u <= 0) continue;
                 // pid_1234_luid_0x..._phys_0_eng_3_engtype_3D
                 int pid = 0;
@@ -172,8 +163,10 @@ namespace PowerWatch
                 double cur;
                 g.PerPid.TryGetValue(pid, out cur);
                 g.PerPid[pid] = Math.Max(cur, u);
-                perEngine.TryGetValue(type, out cur);
-                perEngine[type] = cur + u;
+                int l = name.IndexOf("luid_", StringComparison.Ordinal);
+                string engine = l >= 0 ? name.Substring(l) : name;          // luid_..._phys_0_eng_3_engtype_3D
+                perEngine.TryGetValue(engine, out cur);
+                perEngine[engine] = Math.Min(100, cur + u);
                 if (type.IndexOf("VideoDecode", StringComparison.OrdinalIgnoreCase) >= 0) g.VideoDecode += u;
             }
             double best = 0;
